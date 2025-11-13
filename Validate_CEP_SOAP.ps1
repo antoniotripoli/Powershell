@@ -1,5 +1,5 @@
-# CEP URL
-$CEPUrl = "https://win2k22ca.antdom.local/ADPolicyProvider_CEP_UsernamePassword/service.svc/CEP"
+# CEP URL - replace with your CEP url
+$CEPUrl = "https://ca01.example.com/ADPolicyProvider_CEP_UsernamePassword/service.svc/CEP"
 
 # Prompt for credentials
 $Cred = Get-Credential

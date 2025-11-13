@@ -1,16 +1,20 @@
 ﻿function Test-LdapBind {
     param (
         [string]$domainController,
+        [System.Management.Automation.PSCredential]$cred,
         [System.DirectoryServices.AuthenticationTypes]$authType
     )
 
-    # Prompt for credentials
-    $cred = Get-Credential
     $ldapPath = "LDAP://$domainController"
 
     try {
         # Create DirectoryEntry with selected authentication type
-        $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $cred.UserName, $cred.GetNetworkCredential().Password, $authType)
+        $entry = New-Object System.DirectoryServices.DirectoryEntry(
+            $ldapPath,
+            $cred.UserName,
+            $cred.GetNetworkCredential().Password,
+            $authType
+        )
 
         # Attempt bind
         $null = $entry.NativeObject
@@ -40,6 +44,10 @@
     }
 }
 
+# Prompt once for domain controller and credentials
+$domainController = Read-Host "Enter your domain controller (e.g., dc01.example.com)"
+$cred = Get-Credential
+
 # Main Menu Loop
 do {
     Clear-Host
@@ -52,23 +60,19 @@ do {
 
     switch ($choice) {
         '1' {
-            $domainController = Read-Host "Enter your domain controller (e.g., dc01.example.com)"
-            Test-LdapBind -domainController $domainController -authType ([System.DirectoryServices.AuthenticationTypes]::None)
+            Test-LdapBind -domainController $domainController -cred $cred -authType ([System.DirectoryServices.AuthenticationTypes]::None)
         }
         '2' {
-            $domainController = Read-Host "Enter your domain controller (e.g., dc01.example.com)"
-            Test-LdapBind -domainController $domainController -authType ([System.DirectoryServices.AuthenticationTypes]::Secure)
+            Test-LdapBind -domainController $domainController -cred $cred -authType ([System.DirectoryServices.AuthenticationTypes]::Secure)
         }
         '3' {
-            $domainController = Read-Host "Enter your domain controller (e.g., dc01.example.com)"
-            Test-LdapBind -domainController $domainController -authType ([System.DirectoryServices.AuthenticationTypes]::SecureSocketsLayer)
+            Test-LdapBind -domainController $domainController -cred $cred -authType ([System.DirectoryServices.AuthenticationTypes]::SecureSocketsLayer)
         }
         '4' {
-            Write-Host "Exiting script..." -ForegroundColor Cyan
-            break
+            Write-Host "`nExiting script..." -ForegroundColor Cyan
         }
         default {
-            Write-Host "Invalid choice. Please try again." -ForegroundColor Yellow
+            Write-Host "`nInvalid choice. Please try again." -ForegroundColor Yellow
         }
     }
 
@@ -76,4 +80,4 @@ do {
         Write-Host "`nPress Enter to return to the main menu..."
         Read-Host
     }
-} while ($choice -ne '4')
+} while ($choice -ne "4")

@@ -1,27 +1,56 @@
-﻿function Test-LdapBind {
+﻿<#
+.SYNOPSIS
+    Tests LDAP bind behaviour with different authentication types.
+
+.DESCRIPTION
+    This script allows you to test LDAP binding against a specified domain controller
+    using various authentication types: None, Secure, and SecureSocketsLayer (LDAPS).
+    It helps verify LDAP signing enforcement and LDAPS configuration.
+
+.NOTES
+    Author: Refactored by Enterprise Copilot
+    Version: 2.0
+#>
+
+[CmdletBinding()]
+param ()
+
+function Test-LdapBind {
+    [CmdletBinding()]
     param (
-        [string]$domainController,
-        [System.DirectoryServices.AuthenticationTypes]$authType
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter(Mandatory = $true)]
+        [System.DirectoryServices.AuthenticationTypes]$AuthType
     )
 
+    Write-Verbose "Starting LDAP bind test for $DomainController using $AuthType"
+
     # Prompt for credentials
-    $cred = Get-Credential
-    $ldapPath = "LDAP://$domainController"
+    $cred = Get-Credential -Message "Enter credentials for LDAP bind"
+    $ldapPath = "LDAP://$DomainController"
 
     try {
         # Create DirectoryEntry with selected authentication type
-        $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $cred.UserName, $cred.GetNetworkCredential().Password, $authType)
+        $entry = New-Object System.DirectoryServices.DirectoryEntry(
+            $ldapPath,
+            $cred.UserName,
+            $cred.GetNetworkCredential().Password,
+            $AuthType
+        )
 
         # Attempt bind
         $null = $entry.NativeObject
-        Write-Host "`nLDAP bind successful using authentication type: $authType" -ForegroundColor Green
+        Write-Host "`nLDAP bind successful using authentication type: $AuthType" -ForegroundColor Green
 
         # Attempt to browse directory
         Write-Host "Attempting to browse directory..."
         try {
             $childCount = 0
             foreach ($child in $entry.Children) {
-                Write-Host "Found: $($child.Path)"
+                Write-Output "Found: $($child.Path)"
                 $childCount++
             }
 
@@ -35,7 +64,7 @@
             Write-Error $_
         }
     } catch {
-        Write-Host "`nLDAP bind failed using authentication type: $authType" -ForegroundColor Red
+        Write-Host "`nLDAP bind failed using authentication type: $AuthType" -ForegroundColor Red
         Write-Error $_
     }
 }
@@ -50,9 +79,15 @@ $choice = Read-Host "Enter your choice (1-3)"
 # Set domain controller
 $domainController = Read-Host "Enter your domain controller (e.g., dc01.example.com)"
 
-switch ($choice) {
-    '1' { Test-LdapBind -domainController $domainController -authType 'None' }
-    '2' { Test-LdapBind -domainController $domainController -authType 'Secure' }
-    '3' { Test-LdapBind -domainController $domainController -authType 'SecureSocketsLayer' }
-    default { Write-Host "Invalid choice. Please run the script again." -ForegroundColor Yellow }
+# Map choices to enum values
+$authMap = @{
+    '1' = [System.DirectoryServices.AuthenticationTypes]::None
+    '2' = [System.DirectoryServices.AuthenticationTypes]::Secure
+    '3' = [System.DirectoryServices.AuthenticationTypes]::SecureSocketsLayer
 }
+
+if ($authMap.ContainsKey($choice)) {
+    Test-LdapBind -DomainController $domainController -AuthType $authMap[$choice] -Verbose
+} else {
+    Write-Host "Invalid choice. Please run the script again." -ForegroundColor Yellow
+    }

@@ -1,0 +1,58 @@
+﻿function Test-LdapBind {
+    param (
+        [string]$domainController,
+        [System.DirectoryServices.AuthenticationTypes]$authType
+    )
+
+    # Prompt for credentials
+    $cred = Get-Credential
+    $ldapPath = "LDAP://$domainController"
+
+    try {
+        # Create DirectoryEntry with selected authentication type
+        $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $cred.UserName, $cred.GetNetworkCredential().Password, $authType)
+
+        # Attempt bind
+        $null = $entry.NativeObject
+        Write-Host "`nLDAP bind successful using authentication type: $authType" -ForegroundColor Green
+
+        # Attempt to browse directory
+        Write-Host "Attempting to browse directory..."
+        try {
+            $childCount = 0
+            foreach ($child in $entry.Children) {
+                Write-Host "Found: $($child.Path)"
+                $childCount++
+            }
+
+            if ($childCount -eq 0) {
+                Write-Host "Bind succeeded, but no entries returned. Possible access restriction." -ForegroundColor Yellow
+            } else {
+                Write-Host "Browsing succeeded. LDAP signing may not be enforced." -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "`nBrowsing failed after bind. Likely due to LDAP signing enforcement." -ForegroundColor Red
+            Write-Error $_
+        }
+    } catch {
+        Write-Host "`nLDAP bind failed using authentication type: $authType" -ForegroundColor Red
+        Write-Error $_
+    }
+}
+
+# Menu
+Write-Host "Choose LDAP bind type to test:`n"
+Write-Host "1. Unsigned bind (AuthenticationTypes.None)"
+Write-Host "2. Signed bind (AuthenticationTypes.Secure)"
+Write-Host "3. Signed bind with SSL (AuthenticationTypes.SecureSocketsLayer)"
+$choice = Read-Host "Enter your choice (1-3)"
+
+# Set domain controller
+$domainController = Read-Host "Enter your domain controller (e.g., dc01.example.com)"
+
+switch ($choice) {
+    '1' { Test-LdapBind -domainController $domainController -authType 'None' }
+    '2' { Test-LdapBind -domainController $domainController -authType 'Secure' }
+    '3' { Test-LdapBind -domainController $domainController -authType 'SecureSocketsLayer' }
+    default { Write-Host "Invalid choice. Please run the script again." -ForegroundColor Yellow }
+}

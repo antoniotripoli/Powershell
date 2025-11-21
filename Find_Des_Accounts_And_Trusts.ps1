@@ -1,4 +1,4 @@
-# Script: Find-DesAccountsAndTrusts.ps1
+﻿# Script: Find-DesAccountsAndTrusts.ps1
 # Purpose: Identify AD user accounts and trusts using DES/RC4/AES encryption
 # Provides a menu to check users, trusts, domain encryption types, export reports, or exit
 # Includes a legend for msDS-SupportedEncryptionTypes values
@@ -7,7 +7,7 @@ function Get-EncryptionLegend {
     param([int]$value)
 
     switch ($value) {
-        0  { "Not set → Domain defaults (AES128 + AES256)" }
+        0  { "Not set â†’ Domain defaults (AES128 + AES256)" }
         1  { "DES-CBC-CRC" }
         2  { "DES-CBC-MD5" }
         4  { "RC4-HMAC" }
@@ -66,7 +66,7 @@ function Check-DomainEncryption {
     if ($value -band 16) { $types += "AES256" }
 
     $decoded = if ($types.Count -gt 0) { $types -join " + " }
-               else { "Not set → Domain defaults (AES128 + AES256)" }
+               else { "Not set â†’ Domain defaults (AES128 + AES256)" }
 
     [PSCustomObject]@{
         DomainName          = $domain.Name
@@ -90,19 +90,27 @@ function Check-TrustEncryption {
 
 function Check-ComputerEncryption {
     Write-Host "`n--- Computer Accounts Encryption Types ---"
+
     Get-ADComputer -Filter * -Properties msDS-SupportedEncryptionTypes |
         Select-Object Name,
             @{Name="RawValue";Expression={$_."msDS-SupportedEncryptionTypes"}},
             @{Name="SupportedEncryption";Expression={
-                $value = $_."msDS-SupportedEncryptionTypes"
+                $value = if ($_."msDS-SupportedEncryptionTypes") { [int]$_."msDS-SupportedEncryptionTypes" } else { 0 }
                 $types = @()
                 if ($value -band 1)  { $types += "DES-CBC-CRC" }
                 if ($value -band 2)  { $types += "DES-CBC-MD5" }
                 if ($value -band 4)  { $types += "RC4-HMAC" }
                 if ($value -band 8)  { $types += "AES128" }
                 if ($value -band 16) { $types += "AES256" }
-                if ($types.Count -gt 0) { $types -join " + " } else { "Not set → Domain defaults" }
-            }}
+                if ($types.Count -gt 0) { $types -join " + " } else { "Not set → Domain defaults (AES128 + AES256)" }
+            }},
+            @{Name="WeakFlag";Expression={
+                $value = if ($_."msDS-SupportedEncryptionTypes") { [int]$_."msDS-SupportedEncryptionTypes" } else { 0 }
+                if (($value -band 1) -or ($value -band 2)) { "DES" }
+                elseif ($value -band 4) { "RC4" }
+                else { "None" }
+            }} |
+        Format-Table Name, RawValue, SupportedEncryption, WeakFlag -AutoSize
 }
 
 function Export-DomainReport {
@@ -133,6 +141,32 @@ function Export-UserReport {
     Write-Host "Users report saved to Users_Encryption_Report.csv"
 }
 
+function Export-ComputerReport {
+    $computers = Get-ADComputer -Filter * -Properties msDS-SupportedEncryptionTypes |
+        Select-Object Name,
+            @{Name="RawValue";Expression={$_."msDS-SupportedEncryptionTypes"}},
+            @{Name="SupportedEncryption";Expression={
+                $value = if ($_."msDS-SupportedEncryptionTypes") { [int]$_."msDS-SupportedEncryptionTypes" } else { 0 }
+                $types = @()
+                if ($value -band 1)  { $types += "DES-CBC-CRC" }
+                if ($value -band 2)  { $types += "DES-CBC-MD5" }
+                if ($value -band 4)  { $types += "RC4-HMAC" }
+                if ($value -band 8)  { $types += "AES128" }
+                if ($value -band 16) { $types += "AES256" }
+                if ($types.Count -gt 0) { $types -join " + " } else { "Not set → Domain defaults (AES128 + AES256)" }
+            }},
+            @{Name="WeakFlag";Expression={
+                $value = if ($_."msDS-SupportedEncryptionTypes") { [int]$_."msDS-SupportedEncryptionTypes" } else { 0 }
+                if (($value -band 1) -or ($value -band 2)) { "DES" }
+                elseif ($value -band 4) { "RC4" }
+                else { "None" }
+            }}
+
+    $computers | Export-Csv -Path ".\Computers_Encryption_Report.csv" -NoTypeInformation -Force
+    Write-Host "Computers report saved to Computers_Encryption_Report.csv"
+}
+
+
 function Show-Menu {
     Clear-Host
     Write-Host "====================================="
@@ -146,13 +180,14 @@ function Show-Menu {
     Write-Host "6. Export Domain Report (CSV)"
     Write-Host "7. Export Trusts Report (CSV)"
     Write-Host "8. Export Users Report (CSV)"
-    Write-Host "9. Exit"
+    Write-Host "9. Export Computer Report (CSV)"
+    Write-Host "10. Exit"
     Write-Host "====================================="
 }
 
 do {
     Show-Menu
-    $choice = Read-Host "Select an option (1-9)"
+    $choice = Read-Host "Select an option (1-10)"
 
     switch ($choice) {
         "1" { Get-DesUsers | Format-Table -AutoSize }
@@ -163,11 +198,12 @@ do {
         "6" { Export-DomainReport }
         "7" { Export-TrustReport }
         "8" { Export-UserReport }
-        "9" { Write-Host "Exiting script..."; break }
+        "9" { Export-ComputerReport }
+        "10" { Write-Host "Exiting script..."; break }
         default { Write-Host "Invalid choice. Please select 1-9." }
     }
 
-    if ($choice -ne "9") {
+    if ($choice -ne "10") {
         Write-Host "`nPress Enter to continue..."
         Read-Host
     }

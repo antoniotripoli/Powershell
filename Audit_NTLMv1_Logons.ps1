@@ -1,50 +1,122 @@
+param(
+    [int]$DaysBack = 7,
+    [int]$Throttle = 16,
+    [string]$OutputCsv = ".\NTLMv1_4624_Findings.csv",
+    [switch]$IncludeAnonymous,
+    [string[]]$DomainControllers
+)
 
-# PowerShell Script: Audit NTLMv1 Logons Across All Domain Controllers
-# This script queries Security Event Logs for Event IDs 4624 and 4776 where NTLMv1 was used
-# and exports the results to a central CSV report.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-# Define the list of domain controllers
-$DomainControllers = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+function Get-EventDataValue {
+    param([xml]$Xml, [string]$Name)
+    $n = $Xml.Event.EventData.Data | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if ($null -eq $n) { return $null }
+    $n.'#text'
+}
 
-# Define the output CSV file path
-$OutputPath = "\\CentralServer\Reports\NTLMv1_Audit_Report.csv"
+# Discover DCs if not provided
+if (-not $DomainControllers -or $DomainControllers.Count -eq 0) {
+    $DomainControllers = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+}
 
-# Initialize an array to store results
-$Results = @()
+# FilterXml requires UTC SystemTime
+$startUtc = (Get-Date).AddDays(-[math]::Abs($DaysBack)).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
-foreach ($DC in $DomainControllers) {
-    Write-Host "Collecting NTLMv1 logon events from $DC..."
+# Build the Select clause:
+#   4624 AND time>=start AND AuthPkg=NTLM AND LmPackageName=NTLM V1
+# Optionally exclude ANONYMOUS LOGON (TargetUserSid = S-1-5-7)
+$anonClause = ""
+if (-not $IncludeAnonymous) {
+    $anonClause = "and *[EventData[Data[@Name='TargetUserSid']!='S-1-5-7']]"
+}
 
-    # Query Event ID 4624 (Logon) and 4776 (NTLM Authentication)
-    $Events = Get-WinEvent -ComputerName $DC -FilterHashtable @{
-        LogName = 'Security'
-        Id = 4624, 4776
-        StartTime = (Get-Date).AddDays(-7) # Last 7 days
-    } -ErrorAction SilentlyContinue
+$filterXml = @"
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[System[(EventID=4624) and TimeCreated[@SystemTime >= '$startUtc']]]
+      and *[EventData[Data[@Name='AuthenticationPackageName']='NTLM']]
+      and *[EventData[Data[@Name='LmPackageName']='NTLM V1']]
+      $anonClause
+    </Select>
+  </Query>
+</QueryList>
+"@
 
-    foreach ($Event in $Events) {
-        $Xml = [xml]$Event.ToXml()
-        $AuthPackage = $Xml.Event.EventData.Data | Where-Object { $_.Name -eq 'AuthenticationPackageName' } | Select-Object -ExpandProperty '#text'
-        $LmPackage = $Xml.Event.EventData.Data | Where-Object { $_.Name -eq 'LmPackageName' } | Select-Object -ExpandProperty '#text'
+$scriptBlock = {
+    param($dc, $xmlQuery)
 
-        if ($AuthPackage -eq 'NTLM' -and $LmPackage -eq 'NTLMv1') {
-            $Record = [PSCustomObject]@{
-                TimeCreated = $Event.TimeCreated
-                Computer    = $DC
-                EventID     = $Event.Id
-                UserName    = ($Xml.Event.EventData.Data | Where-Object { $_.Name -eq 'TargetUserName' } | Select-Object -ExpandProperty '#text')
-                IPAddress   = ($Xml.Event.EventData.Data | Where-Object { $_.Name -eq 'IpAddress' } | Select-Object -ExpandProperty '#text')
-                Workstation = ($Xml.Event.EventData.Data | Where-Object { $_.Name -eq 'WorkstationName' } | Select-Object -ExpandProperty '#text')
-            }
-            $Results += $Record
+    function Get-EventDataValue {
+        param([xml]$Xml, [string]$Name)
+        $n = $Xml.Event.EventData.Data | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+        if ($null -eq $n) { return $null }
+        $n.'#text'
+    }
+
+    try {
+        $out = New-Object System.Collections.Generic.List[object]
+        $events = Get-WinEvent -ComputerName $dc -FilterXml $xmlQuery -ErrorAction Stop
+
+        foreach ($ev in $events) {
+            $x = [xml]$ev.ToXml()
+
+            $out.Add([pscustomobject]@{
+                TimeCreated      = $ev.TimeCreated
+                DomainController = $dc
+                TargetUser       = Get-EventDataValue $x 'TargetUserName'
+                TargetDomain     = Get-EventDataValue $x 'TargetDomainName'
+                TargetUserSid    = Get-EventDataValue $x 'TargetUserSid'
+                LogonType        = Get-EventDataValue $x 'LogonType'
+                Workstation      = Get-EventDataValue $x 'WorkstationName'
+                IpAddress        = Get-EventDataValue $x 'IpAddress'
+                LogonProcess     = Get-EventDataValue $x 'LogonProcessName'
+                AuthPackage      = Get-EventDataValue $x 'AuthenticationPackageName'
+                LmPackageName    = Get-EventDataValue $x 'LmPackageName'      # NTLM V1
+                KeyLength        = Get-EventDataValue $x 'KeyLength'
+                ProcessName      = Get-EventDataValue $x 'ProcessName'
+                EventRecordId    = $ev.RecordId
+            })
         }
+
+        $out
+    }
+    catch {
+        Write-Warning "[$dc] FAILED: $($_.Exception.Message)"
     }
 }
 
-# Export results to CSV
-if ($Results.Count -gt 0) {
-    $Results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-    Write-Host "Audit completed. Report saved to $OutputPath"
+# Runspace pool parallelism (PS 5.1 compatible)
+$pool = [RunspaceFactory]::CreateRunspacePool(1, $Throttle)
+$pool.Open()
+
+$jobs = @()
+foreach ($dc in $DomainControllers) {
+    $ps = [PowerShell]::Create()
+    $ps.RunspacePool = $pool
+    $null = $ps.AddScript($scriptBlock).AddArgument($dc).AddArgument($filterXml)
+    $handle = $ps.BeginInvoke()
+    $jobs += [pscustomobject]@{ DC = $dc; PS = $ps; Handle = $handle }
+}
+
+$results = New-Object System.Collections.Generic.List[object]
+foreach ($j in $jobs) {
+    try {
+        $r = $j.PS.EndInvoke($j.Handle)
+        if ($r) { $results.AddRange($r) }
+    } finally {
+        $j.PS.Dispose()
+    }
+}
+
+$pool.Close()
+$pool.Dispose()
+
+if ($results.Count -gt 0) {
+    $results | Sort-Object TimeCreated |
+        Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "FAIL: Found $($results.Count) NTLMv1 logons (4624 LmPackageName=NTLM V1). CSV: $OutputCsv" -ForegroundColor Red
 } else {
-    Write-Host "No NTLMv1 logons found in the last 7 days."
+    Write-Host "PASS: No NTLMv1 logons found (4624 LmPackageName=NTLM V1) in last $DaysBack day(s)." -ForegroundColor Green
 }

@@ -1,309 +1,350 @@
 #Requires -Modules ActiveDirectory
 param(
     [int]$HoursBack = 6,
-    [int]$Throttle  = 12,
+    [int]$Throttle = 12,
     [string]$OutputCsv = ".\Kerberos_FieldOnly_RC4_CurrentDomain.csv"
 )
 
-Import-Module ActiveDirectory
+Import-Module ActiveDirectory -ErrorAction Stop
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# RC4 etypes: 0x17=23, 0x18=24
-$Rc4Ints   = @(23,24)
+$Rc4Ints = @(23,24)
 $StartTime = (Get-Date).AddHours(-[math]::Abs($HoursBack))
 
-# ----------------------------
-# Current domain ONLY DCs
-# ----------------------------
-$curDomain = Get-ADDomain -Current LoggedOnUser
-$DomainControllers = Get-ADDomainController -Filter * -Server $curDomain.DNSRoot |
+$curDomain = Get-ADDomain -Current LoggedOnUser -ErrorAction Stop
+$lookupServer = $curDomain.PDCEmulator
+
+$DomainControllers = @(
+    Get-ADDomainController -Filter * -Server $lookupServer -ErrorAction Stop |
     Select-Object -ExpandProperty HostName |
     Sort-Object -Unique
+)
 
-Write-Host ("Scanning CURRENT DOMAIN [{0}] | DCs: {1} | StartTime: {2}" -f $curDomain.DNSRoot, $DomainControllers.Count, $StartTime) -ForegroundColor Cyan
-
-# ----------------------------
-# Helpers (unchanged)
-# ----------------------------
-function Convert-HexOrInt {
-    param([string]$s)
-    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
-    $v = $s.Trim()
-    if ($v -match '^0x[0-9A-Fa-f]+$') { return [Convert]::ToInt32($v,16) }
-    if ($v -match '^\d+$') { return [int]$v }
-    return $null
+if (@($DomainControllers).Count -eq 0) {
+    throw "No domain controllers found for domain $($curDomain.DNSRoot)."
 }
 
-function Get-SectionBlock {
-    param([string]$Message, [string]$SectionTitle)
-    if ([string]::IsNullOrWhiteSpace($Message) -or [string]::IsNullOrWhiteSpace($SectionTitle)) { return $null }
-    $t = [regex]::Escape($SectionTitle)
-    $pattern = "(?ms)${t}:\s*(.+?)(?:(?:\r?\n){2,}^\w.+?Information:|$)"
-    $m = [regex]::Match($Message, $pattern)
-    if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
-}
+Write-Host ("Scanning CURRENT DOMAIN [{0}] | DCs: {1} | StartTime: {2}" -f $curDomain.DNSRoot, @($DomainControllers).Count, $StartTime) -ForegroundColor Cyan
 
-function Get-FieldValue {
-    param([string]$Block, [string]$Label)
-    if ([string]::IsNullOrWhiteSpace($Block) -or [string]::IsNullOrWhiteSpace($Label)) { return $null }
-    $l = [regex]::Escape($Label)
-    $m = [regex]::Match($Block, "(?m)^\s*${l}\s*:\s*(.+?)\s*$")
-    if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
-}
-
-function Get-AdvertisedEtypesFromNetworkBlock {
-    param([string]$NetworkBlock)
-    if ([string]::IsNullOrWhiteSpace($NetworkBlock)) { return $null }
-    $lines = $NetworkBlock -split "`r?`n"
-    $start = $false
-    $list  = New-Object System.Collections.Generic.List[string]
-    foreach ($ln in $lines) {
-        if ($ln -match 'Adverti[sz]ed Etypes\s*:') { $start = $true; continue }
-        if ($start) {
-            if ($ln -match '^\s*$') { break }
-            $list.Add($ln.Trim()) | Out-Null
-        }
-    }
-    if ($list.Count -gt 0) { ($list -join '; ') } else { $null }
-}
-
-function Build-EventDataHashtable {
-    param([xml]$Xml)
-    $h = @{}
-    $nodes = $Xml.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")
-    foreach ($n in $nodes) {
-        $a = $n.Attributes['Name']
-        if (-not $a) { continue }
-        $k = $a.Value
-        if ([string]::IsNullOrWhiteSpace($k)) { continue }
-        $h[$k.Trim()] = $n.InnerText
-    }
-    return $h
-}
-
-# ----------------------------
-# Worker (per DC)  (unchanged)
-# ----------------------------
 $scriptBlock = {
-    param($dc, $startTime, $rc4Ints)
+    param(
+        [string]$dc,
+        [datetime]$startTime,
+        [int[]]$rc4Ints
+    )
 
-    function Convert-HexOrInt { param([string]$s)
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+
+    function Convert-HexOrInt {
+        param([string]$s)
         if ([string]::IsNullOrWhiteSpace($s)) { return $null }
         $v = $s.Trim()
-        if ($v -match '^0x[0-9A-Fa-f]+$') { return [Convert]::ToInt32($v,16) }
+        if ($v -match '^0x[0-9A-Fa-f]+$') { return [Convert]::ToInt32($v, 16) }
         if ($v -match '^\d+$') { return [int]$v }
         return $null
     }
-    function Get-SectionBlock { param([string]$Message,[string]$SectionTitle)
+
+    function Get-SectionBlock {
+        param(
+            [string]$Message,
+            [string]$SectionTitle
+        )
         if ([string]::IsNullOrWhiteSpace($Message) -or [string]::IsNullOrWhiteSpace($SectionTitle)) { return $null }
-        $t = [regex]::Escape($SectionTitle)
-        $pattern = "(?ms)${t}:\s*(.+?)(?:(?:\r?\n){2,}^\w.+?Information:|$)"
+
+        $escapedTitle = [regex]::Escape($SectionTitle)
+        $pattern = "(?ms)^\s*$escapedTitle\s*:\s*(.*?)(?=^\s*\S.*Information\s*:|\z)"
         $m = [regex]::Match($Message, $pattern)
-        if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
+        if ($m.Success) { return $m.Groups[1].Value.Trim() }
+        return $null
     }
-    function Get-FieldValue { param([string]$Block,[string]$Label)
+
+    function Get-FieldValue {
+        param(
+            [string]$Block,
+            [string]$Label
+        )
         if ([string]::IsNullOrWhiteSpace($Block) -or [string]::IsNullOrWhiteSpace($Label)) { return $null }
-        $l=[regex]::Escape($Label)
-        $m=[regex]::Match($Block,"(?m)^\s*${l}\s*:\s*(.+?)\s*$")
-        if ($m.Success) { $m.Groups[1].Value.Trim() } else { $null }
+
+        $escapedLabel = [regex]::Escape($Label)
+        $m = [regex]::Match($Block, "(?m)^\s*$escapedLabel\s*:\s*(.+?)\s*$")
+        if ($m.Success) { return $m.Groups[1].Value.Trim() }
+        return $null
     }
-    function Get-AdvertisedEtypesFromNetworkBlock { param([string]$NetworkBlock)
+
+    function Get-AdvertisedEtypesFromNetworkBlock {
+        param([string]$NetworkBlock)
         if ([string]::IsNullOrWhiteSpace($NetworkBlock)) { return $null }
-        $lines=$NetworkBlock -split "`r?`n"; $start=$false
-        $list=New-Object System.Collections.Generic.List[string]
-        foreach($ln in $lines){
-            if($ln -match 'Adverti[sz]ed Etypes\s*:'){ $start=$true; continue }
-            if($start){
-                if($ln -match '^\s*$'){ break }
-                $list.Add($ln.Trim()) | Out-Null
+
+        $lines = $NetworkBlock -split "`r?`n"
+        $started = $false
+        $list = New-Object 'System.Collections.Generic.List[string]'
+
+        foreach ($ln in $lines) {
+            if ($ln -match 'Adverti[sz]ed Etypes\s*:') {
+                $started = $true
+                continue
+            }
+            if ($started) {
+                if ($ln -match '^\s*$') { break }
+                $null = $list.Add($ln.Trim())
             }
         }
-        if($list.Count -gt 0){ $list -join '; ' } else { $null }
+
+        if ($list.Count -gt 0) { return ($list -join '; ') }
+        return $null
     }
-    function Build-EventDataHashtable { param([xml]$Xml)
-        $h=@{}
-        $nodes=$Xml.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")
-        foreach($n in $nodes){
-            $a=$n.Attributes['Name']; if(-not $a){ continue }
-            $k=$a.Value; if([string]::IsNullOrWhiteSpace($k)){ continue }
-            $h[$k.Trim()]=$n.InnerText
+
+    function Build-EventDataHashtable {
+        param([xml]$Xml)
+
+        $h = @{}
+        $nodes = $Xml.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")
+
+        foreach ($n in $nodes) {
+            $attr = $n.Attributes['Name']
+            if ($null -eq $attr) { continue }
+
+            $key = $attr.Value
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+            $h[$key.Trim()] = $n.InnerText
         }
+
         return $h
     }
 
-    $rows = New-Object System.Collections.Generic.List[object]
+    $rows = New-Object 'System.Collections.Generic.List[object]'
 
-    $events = Get-WinEvent -ComputerName $dc -FilterHashtable @{
-        LogName   = 'Security'
-        Id        = @(4768,4769)
-        StartTime = $startTime
-    } -ErrorAction SilentlyContinue
+    $events = @(
+        Get-WinEvent -ComputerName $dc -FilterHashtable @{
+            LogName = 'Security'
+            Id = @(4768,4769)
+            StartTime = $startTime
+        } -ErrorAction SilentlyContinue
+    )
 
-    foreach ($evt in @($events)) {
+    foreach ($evt in $events) {
         $msg = $evt.Message
         $xml = $null
-        try { $xml = [xml]$evt.ToXml() } catch { $xml = $null }
+
+        try {
+            $xml = [xml]$evt.ToXml()
+        }
+        catch {
+            $xml = $null
+        }
 
         $data = @{}
-        if ($xml) { $data = Build-EventDataHashtable $xml }
+        if ($null -ne $xml) {
+            $data = Build-EventDataHashtable -Xml $xml
+        }
 
-        $ticketEncRaw  = $data['TicketEncryptionType']
+        $ticketEncRaw = $data['TicketEncryptionType']
         $sessionEncRaw = $data['SessionEncryptionType']
         if (-not $sessionEncRaw) { $sessionEncRaw = $data['SessionKeyEncryptionType'] }
 
         $preAuthEncRaw = $data['PreAuthEncryptionType']
-        $preAuthType   = $data['PreAuthType']
+        $preAuthType = $data['PreAuthType']
 
         $addBlock = Get-SectionBlock -Message $msg -SectionTitle 'Additional Information'
 
-        if (-not $ticketEncRaw)  { $ticketEncRaw  = Get-FieldValue -Block $addBlock -Label 'Ticket Encryption Type' }
-        if (-not $sessionEncRaw) { $sessionEncRaw = Get-FieldValue -Block $addBlock -Label 'Session Encryption Type' }
-
+        if (-not $ticketEncRaw) {
+            $ticketEncRaw = Get-FieldValue -Block $addBlock -Label 'Ticket Encryption Type'
+        }
+        if (-not $sessionEncRaw) {
+            $sessionEncRaw = Get-FieldValue -Block $addBlock -Label 'Session Encryption Type'
+        }
         if (-not $preAuthEncRaw) {
             $preAuthEncRaw = Get-FieldValue -Block $addBlock -Label 'Pre-Authentication EncryptionType'
-            if (-not $preAuthEncRaw) { $preAuthEncRaw = Get-FieldValue -Block $addBlock -Label 'Pre-Authentication Encryption Type' }
+            if (-not $preAuthEncRaw) {
+                $preAuthEncRaw = Get-FieldValue -Block $addBlock -Label 'Pre-Authentication Encryption Type'
+            }
         }
         if (-not $preAuthType) {
             $preAuthType = Get-FieldValue -Block $addBlock -Label 'Pre-Authentication Type'
         }
 
-        $ti = Convert-HexOrInt $ticketEncRaw
-        $si = Convert-HexOrInt $sessionEncRaw
-        $pi = Convert-HexOrInt $preAuthEncRaw
+        $ti = Convert-HexOrInt -s $ticketEncRaw
+        $si = Convert-HexOrInt -s $sessionEncRaw
+        $pi = Convert-HexOrInt -s $preAuthEncRaw
 
-        $isRc4Ticket  = ($ti -ne $null -and ($rc4Ints -contains $ti))
-        $isRc4Session = ($si -ne $null -and ($rc4Ints -contains $si))
-        $isRc4PreAuth = ($pi -ne $null -and ($rc4Ints -contains $pi))
+        $isRc4Ticket = ($null -ne $ti -and ($rc4Ints -contains $ti))
+        $isRc4Session = ($null -ne $si -and ($rc4Ints -contains $si))
+        $isRc4PreAuth = ($null -ne $pi -and ($rc4Ints -contains $pi))
 
         if (-not ($isRc4Ticket -or $isRc4Session -or $isRc4PreAuth)) { continue }
 
-        $rc4Source =
-            if ($isRc4Ticket -and $isRc4Session -and $isRc4PreAuth) { 'Ticket+Session+PreAuth' }
-            elseif ($isRc4Ticket -and $isRc4Session) { 'Ticket+Session' }
-            elseif ($isRc4Ticket -and $isRc4PreAuth) { 'Ticket+PreAuth' }
-            elseif ($isRc4Session -and $isRc4PreAuth) { 'Session+PreAuth' }
-            elseif ($isRc4Ticket)  { 'Ticket' }
-            elseif ($isRc4Session) { 'Session' }
-            elseif ($isRc4PreAuth) { 'PreAuth' }
-            else { 'Unknown' }
+        if ($isRc4Ticket -and $isRc4Session -and $isRc4PreAuth) { $rc4Source = 'Ticket+Session+PreAuth' }
+        elseif ($isRc4Ticket -and $isRc4Session) { $rc4Source = 'Ticket+Session' }
+        elseif ($isRc4Ticket -and $isRc4PreAuth) { $rc4Source = 'Ticket+PreAuth' }
+        elseif ($isRc4Session -and $isRc4PreAuth) { $rc4Source = 'Session+PreAuth' }
+        elseif ($isRc4Ticket) { $rc4Source = 'Ticket' }
+        elseif ($isRc4Session) { $rc4Source = 'Session' }
+        elseif ($isRc4PreAuth) { $rc4Source = 'PreAuth' }
+        else { $rc4Source = 'Unknown' }
 
         $acctBlock = Get-SectionBlock -Message $msg -SectionTitle 'Account Information'
-        $svcBlock  = Get-SectionBlock -Message $msg -SectionTitle 'Service Information'
-        $dcBlock   = Get-SectionBlock -Message $msg -SectionTitle 'Domain Controller Information'
-        $netBlock  = Get-SectionBlock -Message $msg -SectionTitle 'Network Information'
+        $svcBlock = Get-SectionBlock -Message $msg -SectionTitle 'Service Information'
+        $dcBlock = Get-SectionBlock -Message $msg -SectionTitle 'Domain Controller Information'
+        $netBlock = Get-SectionBlock -Message $msg -SectionTitle 'Network Information'
 
-        $accountName   = $data['TargetUserName'];  if (-not $accountName)   { $accountName   = Get-FieldValue $acctBlock 'Account Name' }
-        $accountDomain = $data['TargetDomainName'];if (-not $accountDomain) { $accountDomain = Get-FieldValue $acctBlock 'Supplied Realm Name' }
+        $accountName = $data['TargetUserName']
+        if (-not $accountName) { $accountName = Get-FieldValue -Block $acctBlock -Label 'Account Name' }
 
-        $serviceName = $data['ServiceName']; if (-not $serviceName) { $serviceName = Get-FieldValue $svcBlock 'Service Name' }
+        $accountDomain = $data['TargetDomainName']
+        if (-not $accountDomain) { $accountDomain = Get-FieldValue -Block $acctBlock -Label 'Supplied Realm Name' }
 
-        $accEncTypes = $data['AccountSupportedEncryptionTypes']; if (-not $accEncTypes) { $accEncTypes = Get-FieldValue $acctBlock 'MSDS-SupportedEncryptionTypes' }
-        $accKeys     = $data['AccountAvailableKeys'];            if (-not $accKeys)     { $accKeys     = Get-FieldValue $acctBlock 'Available Keys' }
+        $serviceName = $data['ServiceName']
+        if (-not $serviceName) { $serviceName = Get-FieldValue -Block $svcBlock -Label 'Service Name' }
 
-        $svcEncTypes = $data['ServiceSupportedEncryptionTypes']; if (-not $svcEncTypes) { $svcEncTypes = Get-FieldValue $svcBlock 'MSDS-SupportedEncryptionTypes' }
-        $svcKeys     = $data['ServiceAvailableKeys'];            if (-not $svcKeys)     { $svcKeys     = Get-FieldValue $svcBlock 'Available Keys' }
+        $accEncTypes = $data['AccountSupportedEncryptionTypes']
+        if (-not $accEncTypes) { $accEncTypes = Get-FieldValue -Block $acctBlock -Label 'MSDS-SupportedEncryptionTypes' }
 
-        $dcEncTypes  = $data['DCSupportedEncryptionTypes'];      if (-not $dcEncTypes)  { $dcEncTypes  = Get-FieldValue $dcBlock 'MSDS-SupportedEncryptionTypes' }
-        $dcKeys      = $data['DCAvailableKeys'];                 if (-not $dcKeys)      { $dcKeys      = Get-FieldValue $dcBlock 'Available Keys' }
+        $accKeys = $data['AccountAvailableKeys']
+        if (-not $accKeys) { $accKeys = Get-FieldValue -Block $acctBlock -Label 'Available Keys' }
 
-        $clientAddr = $data['IpAddress']; if (-not $clientAddr) { $clientAddr = Get-FieldValue $netBlock 'Client Address' }
-        $advEtypes  = $data['ClientAdvertizedEncryptionTypes']
-        if (-not $advEtypes) { $advEtypes = Get-AdvertisedEtypesFromNetworkBlock $netBlock }
+        $svcEncTypes = $data['ServiceSupportedEncryptionTypes']
+        if (-not $svcEncTypes) { $svcEncTypes = Get-FieldValue -Block $svcBlock -Label 'MSDS-SupportedEncryptionTypes' }
 
-        $rows.Add([pscustomobject]@{
+        $svcKeys = $data['ServiceAvailableKeys']
+        if (-not $svcKeys) { $svcKeys = Get-FieldValue -Block $svcBlock -Label 'Available Keys' }
+
+        $dcEncTypes = $data['DCSupportedEncryptionTypes']
+        if (-not $dcEncTypes) { $dcEncTypes = Get-FieldValue -Block $dcBlock -Label 'MSDS-SupportedEncryptionTypes' }
+
+        $dcKeys = $data['DCAvailableKeys']
+        if (-not $dcKeys) { $dcKeys = Get-FieldValue -Block $dcBlock -Label 'Available Keys' }
+
+        $clientAddr = $data['IpAddress']
+        if (-not $clientAddr) { $clientAddr = Get-FieldValue -Block $netBlock -Label 'Client Address' }
+
+        $advEtypes = $data['ClientAdvertizedEncryptionTypes']
+        if (-not $advEtypes) { $advEtypes = Get-AdvertisedEtypesFromNetworkBlock -NetworkBlock $netBlock }
+
+        $null = $rows.Add([pscustomobject]@{
             DomainController = $dc
-            TimeCreated      = $evt.TimeCreated
-            EventID          = $evt.Id
-            AccountName      = $accountName
-            AccountDomain    = $accountDomain
+            TimeCreated = $evt.TimeCreated
+            EventID = $evt.Id
+            AccountName = $accountName
+            AccountDomain = $accountDomain
             'Account MSDS-SupportedEncryptionTypes' = $accEncTypes
-            'Account Available Keys'               = $accKeys
-            ServiceName      = $serviceName
+            'Account Available Keys' = $accKeys
+            ServiceName = $serviceName
             'Service MSDS-SupportedEncryptionTypes' = $svcEncTypes
-            'Service Available Keys'               = $svcKeys
-            'DC MSDS-SupportedEncryptionTypes'      = $dcEncTypes
-            'DC Available Keys'                     = $dcKeys
-            ClientAddress    = $clientAddr
+            'Service Available Keys' = $svcKeys
+            'DC MSDS-SupportedEncryptionTypes' = $dcEncTypes
+            'DC Available Keys' = $dcKeys
+            ClientAddress = $clientAddr
             AdvertizedEtypes = $advEtypes
-            TicketEncryptionType            = $ticketEncRaw
-            SessionEncryptionType           = $sessionEncRaw
-            PreAuthenticationType           = $preAuthType
+            TicketEncryptionType = $ticketEncRaw
+            SessionEncryptionType = $sessionEncRaw
+            PreAuthenticationType = $preAuthType
             PreAuthenticationEncryptionType = $preAuthEncRaw
-            RC4Source        = $rc4Source
-        }) | Out-Null
+            RC4Source = $rc4Source
+        })
     }
 
-    $rows
+    return $rows
 }
 
-# ----------------------------
-# Parallel runspace pool (improved collection + streaming output)
-# ----------------------------
-# Make output paths robust even if relative + file doesn't exist yet
-$OutputCsvFull = if ([IO.Path]::IsPathRooted($OutputCsv)) { $OutputCsv } else { Join-Path (Get-Location).Path $OutputCsv }
-$ErrorLog = $OutputCsvFull + ".errors.txt"
+$columns = @(
+    'DomainController',
+    'TimeCreated',
+    'EventID',
+    'AccountName',
+    'AccountDomain',
+    'Account MSDS-SupportedEncryptionTypes',
+    'Account Available Keys',
+    'ServiceName',
+    'Service MSDS-SupportedEncryptionTypes',
+    'Service Available Keys',
+    'DC MSDS-SupportedEncryptionTypes',
+    'DC Available Keys',
+    'ClientAddress',
+    'AdvertizedEtypes',
+    'TicketEncryptionType',
+    'SessionEncryptionType',
+    'PreAuthenticationType',
+    'PreAuthenticationEncryptionType',
+    'RC4Source'
+)
 
-# Ensure output folder exists
+$OutputCsvFull = if ([IO.Path]::IsPathRooted($OutputCsv)) {
+    $OutputCsv
+}
+else {
+    Join-Path -Path (Get-Location).Path -ChildPath $OutputCsv
+}
+
+$ErrorLog = "$OutputCsvFull.errors.txt"
 $outDir = Split-Path -Path $OutputCsvFull -Parent
-if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
-# If an old CSV exists, keep it as backup (optional but useful)
-if (Test-Path $OutputCsvFull) {
-    $bak = $OutputCsvFull + "." + (Get-Date -Format "yyyyMMdd_HHmmss") + ".bak"
+if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+}
+
+if (Test-Path -LiteralPath $OutputCsvFull) {
+    $bak = "$OutputCsvFull.$(Get-Date -Format 'yyyyMMdd_HHmmss').bak"
     Copy-Item -LiteralPath $OutputCsvFull -Destination $bak -Force
     Remove-Item -LiteralPath $OutputCsvFull -Force
+}
+
+if (Test-Path -LiteralPath $ErrorLog) {
+    Remove-Item -LiteralPath $ErrorLog -Force
 }
 
 $pool = [RunspaceFactory]::CreateRunspacePool(1, $Throttle)
 $pool.Open()
 
 $jobs = @()
+
 foreach ($dc in $DomainControllers) {
     $ps = [PowerShell]::Create()
     $ps.RunspacePool = $pool
-    $null = $ps.AddScript($scriptBlock).AddArgument($dc).AddArgument($StartTime).AddArgument($Rc4Ints)
+    $null = $ps.AddScript($scriptBlock.ToString()).AddArgument($dc).AddArgument($StartTime).AddArgument($Rc4Ints)
     $handle = $ps.BeginInvoke()
-    $jobs += [pscustomobject]@{ DC=$dc; PS=$ps; Handle=$handle }
+
+    $jobs += [pscustomobject]@{
+        DC = $dc
+        PS = $ps
+        Handle = $handle
+    }
 }
 
 $headerWritten = $false
 $completed = 0
 $totalRows = 0
-$rc4Counts = @{}   # RC4Source -> count
+$rc4Counts = @{}
+$pending = @($jobs)
 
-# Process in completion order (so we don't block on a slow first DC)
-$pending = New-Object System.Collections.Generic.List[object]
-$pending.AddRange($jobs)
-
-while ($pending.Count -gt 0) {
-
-    # Grab all completed jobs this loop
+while (@($pending).Count -gt 0) {
     $doneNow = @($pending | Where-Object { $_.Handle.IsCompleted })
 
-    if ($doneNow.Count -eq 0) {
+    if (@($doneNow).Count -eq 0) {
         Start-Sleep -Milliseconds 250
         continue
     }
 
     foreach ($j in $doneNow) {
         try {
-            $r = $j.PS.EndInvoke($j.Handle)
+            $r = @($j.PS.EndInvoke($j.Handle))
 
-            if ($r) {
-                $chunk = @($r) | Sort-Object TimeCreated
+            if (@($r).Count -gt 0) {
+                $chunk = @($r | Sort-Object TimeCreated)
 
                 if (-not $headerWritten) {
-                    $chunk | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsvFull
+                    $chunk | Select-Object $columns | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsvFull
                     $headerWritten = $true
-                } else {
-                    $chunk | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsvFull -Append
+                }
+                else {
+                    $chunk | Select-Object $columns | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsvFull -Append
                 }
 
-                $totalRows += $chunk.Count
+                $totalRows += @($chunk).Count
 
-                # Update RC4Source counters without storing everything
-                foreach ($g in ($chunk | Group-Object RC4Source)) {
+                foreach ($g in @($chunk | Group-Object RC4Source)) {
                     if (-not $rc4Counts.ContainsKey($g.Name)) { $rc4Counts[$g.Name] = 0 }
                     $rc4Counts[$g.Name] += $g.Count
                 }
@@ -315,12 +356,10 @@ while ($pending.Count -gt 0) {
         }
         finally {
             $j.PS.Dispose()
-            [void]$pending.Remove($j)
             $completed++
+            $pending = @($pending | Where-Object { $_ -ne $j })
 
-            if (($completed % 20) -eq 0) {
-                Write-Host ("Progress: {0}/{1} DCs completed | Rows so far: {2} | CSV: {3}" -f $completed, $jobs.Count, $totalRows, $OutputCsvFull) -ForegroundColor Yellow
-            }
+            Write-Host ("Progress: {0}/{1} DCs completed | Rows so far: {2}" -f $completed, @($jobs).Count, $totalRows) -ForegroundColor Yellow
         }
     }
 }
@@ -328,15 +367,24 @@ while ($pending.Count -gt 0) {
 $pool.Close()
 $pool.Dispose()
 
-Write-Host ("DONE. Rows: {0}  CSV: {1}" -f $totalRows, $OutputCsvFull) -ForegroundColor Green
+if (-not $headerWritten) {
+    $empty = [pscustomobject]@{}
+    foreach ($c in $columns) {
+        $empty | Add-Member -NotePropertyName $c -NotePropertyValue $null
+    }
+    $empty | Select-Object $columns | Select-Object -First 0 | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutputCsvFull
+}
+
+Write-Host ("DONE. Rows: {0}  CSV: {1}" -f $totalRows, (Resolve-Path -LiteralPath $OutputCsvFull).Path) -ForegroundColor Green
 
 if ($rc4Counts.Count -gt 0) {
     $summary = ($rc4Counts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
     Write-Host ("RC4 by source: {0}" -f $summary) -ForegroundColor Cyan
-} else {
-    Write-Host "RC4 by source: (no rows)" -ForegroundColor Cyan
+}
+else {
+    Write-Host "RC4 by source: no rows" -ForegroundColor Cyan
 }
 
-if (Test-Path $ErrorLog) {
-    Write-Host ("Some DCs had errors. See: {0}" -f $ErrorLog) -ForegroundColor DarkYellow
+if (Test-Path -LiteralPath $ErrorLog) {
+    Write-Host ("Some DCs had errors. See: {0}" -f (Resolve-Path -LiteralPath $ErrorLog).Path) -ForegroundColor DarkYellow
 }
